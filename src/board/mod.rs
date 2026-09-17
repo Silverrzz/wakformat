@@ -1,0 +1,20 @@
+#[allow(clippy::module_inception)]
+pub mod board;
+pub mod castling;
+pub mod en_passant;
+pub mod fen;
+pub mod is_legal;
+pub mod make_move;
+pub mod movegen;
+pub mod perft;
+pub mod sliders;
+pub mod startpos;
+pub mod zobrist;
+pub mod display;
+
+pub use board::*;
+pub use castling::*;
+pub use en_passant::*;
+pub use movegen::*;
+pub use sliders::*;
+pub use zobrist::*;
