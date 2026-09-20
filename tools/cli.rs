@@ -13,10 +13,10 @@ pub fn args() -> Vec<String> {
     }).collect()
 }
 
-pub fn output(path: &str, inputs: &[String], overwrite: bool) -> io::Result<File> {
+pub fn output(path: &str, inputs: &[impl AsRef<Path>], overwrite: bool) -> io::Result<File> {
     if let Ok(target) = Path::new(path).canonicalize() {
         for input in inputs {
-            let source = Path::new(input).canonicalize()?;
+            let source = input.as_ref().canonicalize()?;
             let same = if cfg!(windows) {
                 target.to_string_lossy().eq_ignore_ascii_case(&source.to_string_lossy())
             } else { target == source };

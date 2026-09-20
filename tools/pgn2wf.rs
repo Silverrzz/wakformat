@@ -1,9 +1,10 @@
 // Convert duck chess PGN games to wakformat.
-mod cli;
+use crate::cli;
 
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, BufWriter, Write};
-use std::sync::{Mutex, atomic::{AtomicBool, AtomicU64, Ordering}, mpsc};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
+use std::path::Path;
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}, mpsc};
 use std::time::Instant;
 use wakformat::board::{Board, CastlingDirection};
 use wakformat::common::{Color, File as ChessFile, Move, Piece, Rank, Square};
@@ -418,9 +419,83 @@ fn convert(game: &Game, options: Options, bytes: &mut Vec<u8>, scores: &mut Vec<
     Ok(missing)
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn has_extension(path: &Path, extension: &str) -> bool {
+    path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case(extension))
+}
+
+fn is_pgn(path: &Path) -> bool {
+    has_extension(path, "pgn") || (has_extension(path, "bz2")
+        && path.file_stem().is_some_and(|stem| has_extension(Path::new(stem), "pgn")))
+}
+
+struct GameReader<'a> {
+    send: mpsc::SyncSender<(Arc<str>, u64, Game)>,
+    failed: &'a AtomicBool,
+    skipped: &'a AtomicU64,
+    skip_broken: bool,
+}
+
+impl GameReader<'_> {
+    fn pgn(&self, reader: impl Read, source: Arc<str>) -> io::Result<()> {
+        let mut reader = BufReader::with_capacity(8 * 1024 * 1024, reader);
+        if reader.fill_buf()?.starts_with(&[0xef, 0xbb, 0xbf]) { reader.consume(3); }
+        let mut reader = Pgn { reader, token: Vec::with_capacity(256), pending_tag: false };
+        let mut index = 0;
+        while !self.failed.load(Ordering::Relaxed) {
+            match reader.game() {
+                Ok(Some(game)) => {
+                    index += 1;
+                    self.send.send((Arc::clone(&source), index, game))
+                        .map_err(|_| io::Error::other("conversion workers disconnected"))?;
+                }
+                Ok(None) => break,
+                Err(e) if self.skip_broken && e.kind() == io::ErrorKind::InvalidData => {
+                    index += 1;
+                    self.skipped.fetch_add(1, Ordering::Relaxed);
+                    eprintln!("{source}: game {index}: {e}; skipped");
+                    if !reader.recover()? { break; }
+                }
+                Err(e) => return Err(io::Error::new(e.kind(), format!("game {}: {e}", index + 1))),
+            }
+        }
+        Ok(())
+    }
+
+    fn source(&self, reader: impl Read, path: &Path, source: Arc<str>) -> io::Result<()> {
+        if has_extension(path, "bz2") {
+            self.pgn(bzip2::read::MultiBzDecoder::new(reader), source)
+        } else {
+            self.pgn(reader, source)
+        }
+    }
+
+    fn file(&self, path: &Path) -> io::Result<()> {
+        let file = File::open(path)?;
+        if has_extension(path, "tar") {
+            let mut archive = tar::Archive::new(BufReader::with_capacity(1024 * 1024, file));
+            let mut found = false;
+            for entry in archive.entries()? {
+                if self.failed.load(Ordering::Relaxed) { return Ok(()); }
+                let entry = entry?;
+                if !entry.header().entry_type().is_file() { continue; }
+                let entry_path = entry.path()?.into_owned();
+                if !is_pgn(&entry_path) { continue; }
+                found = true;
+                let source = format!("{}: {}", path.display(), entry_path.display()).into();
+                self.source(entry, &entry_path, source)
+                    .map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", entry_path.display())))?;
+            }
+            if !found { return Err(invalid("archive contains no .pgn or .pgn.bz2 files")); }
+            Ok(())
+        } else {
+            self.source(file, path, path.to_string_lossy().into_owned().into())
+        }
+    }
+}
+
+pub fn run(args: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
     // Parse conversion options and input/output paths.
-    let mut args = cli::args().into_iter().peekable();
+    let mut args = args.into_iter().peekable();
     let mut input = None;
     let mut output = None;
     let mut overwrite = false;
@@ -429,8 +504,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut options = Options { fill: Fill::None, skip_broken: false };
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--input" => input = Some(args.next().ok_or("missing input")?),
-            "--output" => output = Some(args.next().ok_or("missing output")?),
+            "--input" | "-i" => input = Some(args.next().ok_or("missing input")?),
+            "--output" | "-o" => output = Some(args.next().ok_or("missing output")?),
             "--threads" => threads = args.next().ok_or("missing thread count")?.parse()?,
             "--skip-broken-games" => options.skip_broken = cli::flag(&mut args),
             "--allow-non-pgn-extension" => allow_extension = cli::flag(&mut args),
@@ -442,29 +517,61 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 };
             }
             "--help" | "-h" | "help" => {
-                println!("pgn2wf --input <INPUT.pgn> [INPUT.pgn (positional)] [--output <OUTPUT>]\n       [--skip-broken-games] [--allow-non-pgn-extension] [--allow-overwrite]\n       [--fill-missing-evals <i16|prev|next>] [--threads N]\n\nDefault output: <INPUT>.wf\nRegular SAN with @square after each move; variations are skipped.\nEvaluation comments are pre-move, side-to-move scores, as in Pawnocchio.\nMissing evaluations fail unless filled or --skip-broken-games is enabled.\nA final king capture may omit @square; its stored duck payload is the source square.\nConversion runs in parallel and writes games in completion order.");
+                println!("Usage: wakformat pgn2wf <INPUT> [OPTIONS]
+
+Convert a PGN, .pgn.bz2, .tar archive, or folder to .wf.
+
+Options:
+  -i, --input <PATH>          Alternative to positional input
+  -o, --output <PATH>         Output file (default: <INPUT>.wf or <FOLDER>/combined.wf)
+      --allow-overwrite      Replace an existing output file
+      --skip-broken-games    Skip games that cannot be converted
+      --fill-missing-evals <i16|prev|next>
+                            Fill missing evaluations
+      --threads <N>          Worker count (default: available parallelism)
+      --allow-non-pgn-extension
+                            Accept other single-file extensions
+  -h, --help                 Show this help
+
+Example: wakformat pgn2wf games.pgn.tar -o games.wf");
                 return Ok(());
             }
             _ if !arg.starts_with('-') && input.is_none() => input = Some(arg),
             _ => return Err(format!("unknown argument {arg}").into()),
         }
     }
-    let input = input.ok_or("missing --input <INPUT.pgn>")?;
-    if !allow_extension && !input.ends_with(".pgn") {
-        return Err("input must end in .pgn (or use --allow-non-pgn-extension)".into());
-    }
+    let input = input.ok_or("missing input; usage: wakformat pgn2wf <INPUT> [OPTIONS]")?;
+    let input_path = Path::new(&input);
+    let directory = input_path.metadata()?.is_dir();
+    let inputs = if directory {
+        let mut paths = Vec::new();
+        for entry in std::fs::read_dir(input_path)? {
+            let entry = entry?;
+            let path = entry.path();
+            if is_pgn(&path) && path.metadata()?.is_file() { paths.push(path); }
+        }
+        paths.sort();
+        if paths.is_empty() { return Err(format!("no .pgn or .pgn.bz2 files found in {}", input_path.display()).into()); }
+        paths
+    } else {
+        if !allow_extension && !is_pgn(input_path) && !has_extension(input_path, "tar") {
+            return Err("input must end in .pgn, .pgn.bz2, or .tar (or use --allow-non-pgn-extension)".into());
+        }
+        vec![input_path.to_path_buf()]
+    };
     if threads == 0 || threads > 1024 { return Err("invalid thread count".into()); }
-    let output = output.unwrap_or_else(|| format!("{input}.wf"));
+    let output = output.unwrap_or_else(|| {
+        if directory { input_path.join("combined.wf").to_string_lossy().into_owned() }
+        else { format!("{input}.wf") }
+    });
     let started = Instant::now();
-    let mut reader = Pgn { reader: BufReader::with_capacity(8 * 1024 * 1024, File::open(&input)?), token: Vec::with_capacity(256), pending_tag: false };
-    if reader.reader.fill_buf()?.starts_with(&[0xef, 0xbb, 0xbf]) { reader.reader.consume(3); }
     let mut writer = BufWriter::with_capacity(8 * 1024 * 1024,
-        cli::output(&output, std::slice::from_ref(&input), overwrite)?);
+        cli::output(&output, &inputs, overwrite)?);
     writer.write_all(&FILE_HEADER)?;
     Board::startpos();
     let writer = Mutex::new(writer);
     // Limit queued games to keep parsing from outrunning the workers.
-    let (send, receive) = mpsc::sync_channel::<(u64, Game)>(threads * 2);
+    let (send, receive) = mpsc::sync_channel::<(Arc<str>, u64, Game)>(threads * 2);
     let receive = Mutex::new(receive);
     let failed = AtomicBool::new(false);
     let error = Mutex::new(None::<String>);
@@ -482,18 +589,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let mut scores = Vec::with_capacity(256);
                 loop {
                     let job = receive.lock().unwrap().recv();
-                    let Ok((index, game)) = job else { break; };
+                    let Ok((source, index, game)) = job else { break; };
                     if failed.load(Ordering::Relaxed) { continue; }
                     let count = match convert(&game, options, &mut bytes, &mut scores) {
                         Ok(count) => count,
                         Err(e) if options.skip_broken => {
                             skipped.fetch_add(1, Ordering::Relaxed);
-                            eprintln!("game {index}: {e}; skipped");
+                            eprintln!("{source}: game {index}: {e}; skipped");
                             continue;
                         }
                         Err(e) => {
                             if !failed.swap(true, Ordering::Relaxed) {
-                                *error.lock().unwrap() = Some(format!("game {index}: {e}"));
+                                *error.lock().unwrap() = Some(format!("{source}: game {index}: {e}"));
                             }
                             continue;
                         }
@@ -511,38 +618,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             });
         }
         // Parse games sequentially and pass them to the worker queue.
-        let mut index = 0;
-        while !failed.load(Ordering::Relaxed) {
-            match reader.game() {
-                Ok(Some(game)) => {
-                    index += 1;
-                    if send.send((index, game)).is_err() { break; }
+        let reader = GameReader { send, failed: &failed, skipped: &skipped, skip_broken: options.skip_broken };
+        for path in &inputs {
+            if failed.load(Ordering::Relaxed) { break; }
+            if let Err(e) = reader.file(path) {
+                if !failed.swap(true, Ordering::Relaxed) {
+                    *error.lock().unwrap() = Some(format!("{}: {e}", path.display()));
                 }
-                Ok(None) => break,
-                Err(e) if options.skip_broken => {
-                    index += 1;
-                    skipped.fetch_add(1, Ordering::Relaxed);
-                    eprintln!("game {index}: {e}; skipped");
-                    match reader.recover() {
-                        Ok(true) => continue,
-                        Ok(false) => break,
-                        Err(e) => {
-                            failed.store(true, Ordering::Relaxed);
-                            *error.lock().unwrap() = Some(e.to_string());
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    if !failed.swap(true, Ordering::Relaxed) {
-                        *error.lock().unwrap() = Some(format!("game {}: {e}", index + 1));
-                    }
-                    break;
-                }
+                break;
             }
         }
         // Closing the queue lets workers finish and exit.
-        drop(send);
+        drop(reader);
     });
     writer.into_inner().unwrap().flush()?;
     if let Some(error) = error.into_inner().unwrap() { return Err(error.into()); }
@@ -553,11 +640,4 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         positions.load(Ordering::Relaxed), missing.load(Ordering::Relaxed),
         positions.load(Ordering::Relaxed) as f64 / seconds.max(0.000001));
     Ok(())
-}
-
-fn main() {
-    if let Err(error) = run() {
-        eprintln!("pgn2wf: {error}");
-        std::process::exit(1);
-    }
 }

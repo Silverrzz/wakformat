@@ -1,1 +1,4 @@
 /target
+*.wf
+score_distribution.txt
+*.pgn*
