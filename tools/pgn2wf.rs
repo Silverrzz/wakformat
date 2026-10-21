@@ -1,5 +1,6 @@
 // Convert duck chess PGN games to wakformat.
 use crate::cli;
+pub(super) mod wdl;
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
@@ -15,6 +16,10 @@ use wakformat::util::Abort;
 struct Game {
     fen: Option<String>,
     result: Option<GameOutcome>,
+    white: Option<String>,
+    black: Option<String>,
+    variant: Option<String>,
+    termination: Option<String>,
     initial_eval: Option<i16>,
     plies: Vec<Ply>,
 }
@@ -54,6 +59,11 @@ struct Pgn<R> {
 }
 
 impl<R: BufRead> Pgn<R> {
+    fn new(mut reader: R) -> io::Result<Self> {
+        if reader.fill_buf()?.starts_with(&[0xef, 0xbb, 0xbf]) { reader.consume(3); }
+        Ok(Self { reader, token: Vec::with_capacity(256), pending_tag: false })
+    }
+
     fn peek(&mut self) -> io::Result<Option<u8>> {
         Ok(self.reader.fill_buf()?.first().copied())
     }
@@ -156,6 +166,10 @@ impl<R: BufRead> Pgn<R> {
                 match name {
                     "FEN" => game.fen = Some(value.to_owned()),
                     "Result" => game.result = outcome(value)?,
+                    "White" => game.white = Some(value.to_owned()),
+                    "Black" => game.black = Some(value.to_owned()),
+                    "Variant" => game.variant = Some(value.to_owned()),
+                    "Termination" => game.termination = Some(value.to_owned()),
                     _ => {}
                 }
             } else if kind == b'{' {
@@ -222,7 +236,7 @@ fn evaluation(comment: &str) -> io::Result<Option<i16>> {
     }
     let Ok(value) = text.parse::<f64>() else { return Ok(None); };
     if !value.is_finite() { return Ok(None); }
-    Ok(Some((value.clamp(-327.67, 327.67) * 100.0) as i16))
+    Ok(Some((value.clamp(-327.67, 327.67) * 100.0).round() as i16))
 }
 
 fn square(text: &str) -> Option<Square> {
@@ -437,9 +451,7 @@ struct GameReader<'a> {
 
 impl GameReader<'_> {
     fn pgn(&self, reader: impl Read, source: Arc<str>) -> io::Result<()> {
-        let mut reader = BufReader::with_capacity(8 * 1024 * 1024, reader);
-        if reader.fill_buf()?.starts_with(&[0xef, 0xbb, 0xbf]) { reader.consume(3); }
-        let mut reader = Pgn { reader, token: Vec::with_capacity(256), pending_tag: false };
+        let mut reader = Pgn::new(BufReader::with_capacity(8 * 1024 * 1024, reader))?;
         let mut index = 0;
         while !self.failed.load(Ordering::Relaxed) {
             match reader.game() {

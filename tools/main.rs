@@ -13,6 +13,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     if help || args.is_empty() { args.push("--help".into()); }
     match command.as_deref() {
         Some("pgn2wf") => pgn2wf::run(args),
+        Some("pgnwdl") => pgn2wf::wdl::run(args),
         Some("interleave") => interleave::run(args),
         Some("analyse") => analyse::run(args),
         None | Some("--help" | "-h") => {
@@ -20,6 +21,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 Commands:
   pgn2wf      Convert PGNs, compressed PGNs, or tar archives to .wf
+  pgnwdl      Extract Duck960 statistics for Stockfish's WDL fitter
   interleave  Mix one or more .wf files into one output
   analyse     Report position, result and distribution statistics
 
